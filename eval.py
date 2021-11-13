@@ -67,7 +67,7 @@ def eval_DAVIS(model, model_name, dataloader):
             overlay_path = os.path.join(overlay_dir, '00000.png')
             myutils.save_overlay(frames[0], pred, overlay_path, palette)
 
-        fb = FeatureBank(obj_n, H/16, W/16)
+        fb = FeatureBank(obj_n, int(H/16), int(W/16))
         k4, v4_list, h, w = model.memorize(frames[0:1], pred_mask, 0, 0, fb)
         keys = k4.clone()
         values_list = v4_list.copy()

@@ -5,7 +5,7 @@ import numpy as np
 
 class TimeEncoding(nn.Module):
 
-    def __init__(self, d_hid, nframe=50, nposition=900):
+    def __init__(self, d_hid, nframe=50, nposition=2500):
         super(TimeEncoding, self).__init__()
 
         # Not a parameter
