@@ -54,27 +54,23 @@ def run_pretrain(model, dataloader, criterion, optimizer, epoch, seed, skips, vi
 
         frames, masks, obj_n, info = sample
 
-
         obj_n = obj_n.item()
         if obj_n == 1:
             continue
 
         frames, masks = frames[0].to(device), masks[0].to(device)
 
-        fb_global = FeatureBank(obj_n, 25, 25)
-        k4, v4_list, h, w = model.memorize(frames[0:1], masks[0:1], 0, 0, fb_global)
-        fb_global.init_values(v4_list)
+        k4, v4_list, h, w = model.memorize(frames[0:1], masks[0:1], 0, 0)
+        fb_global = FeatureBank(obj_n, h, w)
+        fb_global.init_bank(k4, v4_list)
 
         mb = MaskBank(obj_n)
         maskforbank = nn.functional.interpolate(masks[0:1], size=(25, 25), mode='bilinear', align_corners=True)
         maskforbank = maskforbank.view(obj_n, 1, -1)
-
-        for i in range(obj_n):
-            maskforbank[i] = (maskforbank[i] == i).long()
         mask_list = [maskforbank[i] for i in range(obj_n)]
         mb.init_bank(mask_list)
 
-        scores, uncertainty, _ = model.segment(frames[1:], fb_global, mb, True)
+        scores, uncertainty, _ = model.segment(frames[1:], fb_global, mb, True, 0)
         label = torch.argmax(masks[1:], dim=1).long()
 
         loss = criterion(scores, label)
@@ -82,7 +78,7 @@ def run_pretrain(model, dataloader, criterion, optimizer, epoch, seed, skips, vi
 
         loss.backward()
 
-        if((iter_idx+1) % args.bs) == 0:
+        if ((iter_idx + 1) % args.bs) == 0:
             optimizer.step()
             optimizer.zero_grad()
 
@@ -91,7 +87,6 @@ def run_pretrain(model, dataloader, criterion, optimizer, epoch, seed, skips, vi
         progress_bar.set_postfix(
             loss=f'{loss.detach().item():.5f} ({stats.avg:.5f} {uncertainty_stats.avg:.5f})')
 
-        
         if iter_idx % 10000 == 0:
             checkpoint = {
                 'epoch': epoch,
@@ -101,7 +96,7 @@ def run_pretrain(model, dataloader, criterion, optimizer, epoch, seed, skips, vi
                 'seed': seed,
                 'max_skip': skips,
             }
-            vis_writer.add_scalar('iter/loss', loss.detach().item(), (epoch*180000)+iter_idx)
+            vis_writer.add_scalar('iter/loss', loss.detach().item(), (epoch * 180000) + iter_idx)
 
             checkpoint_path = f'{model_path}/epoch_{epoch:03d}_{iter_idx}.pth'
             torch.save(checkpoint, checkpoint_path)
@@ -126,17 +121,13 @@ def run_maintrain(model, dataloader, criterion, optimizer):
 
         frames, masks = frames[0].to(device), masks[0].to(device)
 
-        fb_global = FeatureBank(obj_n, 25, 25)
-        k4, v4_list, h, w = model.memorize(frames[0:1], masks[0:1], 0, 0, fb_global)
-        fb_global.init_values(v4_list)
+        k4, v4_list, h, w = model.memorize(frames[0:1], masks[0:1], frame_idx=0, f16=0)
+        fb_global = FeatureBank(obj_n, h, w)
+        fb_global.init_bank(k4, v4_list)
 
         mb = MaskBank(obj_n)
-        maskforbank = nn.functional.interpolate(masks[0:1], size=(25, 25), mode='bilinear', align_corners=True)
+        maskforbank = nn.functional.interpolate(masks[0:1], size=(30, 30), mode='bilinear', align_corners=True)
         maskforbank = maskforbank.view(obj_n, 1, -1)
-
-        for i in range(obj_n):
-            maskforbank[i] = (maskforbank[i] == i).long()
-
         mask_list = [maskforbank[i] for i in range(obj_n)]
         mb.init_bank(mask_list)
 
@@ -146,7 +137,8 @@ def run_maintrain(model, dataloader, criterion, optimizer):
         uncertainties = torch.zeros(frame_n - 1).to(device)
 
         for t in range(1, frame_n):
-            score, uncertainty, r4 = model.segment(frames[t:t + 1], fb_global, mb, False)  # 1 , obj_n , H , W
+            score, uncertainty, r4 = model.segment(frames[t:t + 1], fb_global, mb, False,
+                                                           frame_idx=t)  # 1 , obj_n , H , W
             scores[t - 1] = score[0]
             uncertainties[t - 1] = uncertainty
 
@@ -156,13 +148,11 @@ def run_maintrain(model, dataloader, criterion, optimizer):
                 predforupdate[:, j] = (pred == j).long()
 
             if t < frame_n - 1:
-                k4, v4_list, _, _ = model.memorize(frames[t:t + 1], masks[t:t + 1], t, r4, fb_global)
-                fb_global.update_values(v4_list)
-                maskforbank = nn.functional.interpolate(predforupdate, size=(25, 25), mode='bilinear',
-                                                          align_corners=True)
+                k4, v4_list, _, _ = model.memorize(frames[t:t + 1], masks[t:t + 1], t, r4)
+                fb_global.update(k4, v4_list)
+                maskforbank = nn.functional.interpolate(predforupdate, size=(30, 30), mode='bilinear',
+                                                        align_corners=True)
                 maskforbank = maskforbank.view(obj_n, 1, -1)
-                for i in range(obj_n):
-                    maskforbank[i] = (maskforbank[i] == i).long()
                 prev_list = [maskforbank[i] for i in range(obj_n)]
                 mb.update(prev_list)
 
@@ -182,7 +172,7 @@ def run_maintrain(model, dataloader, criterion, optimizer):
         uncertainty_stats.update(uncertainty.item())
         stats.update(loss.detach().item())
         progress_bar.set_postfix(
-            loss=f'{loss.detach().item()*args.bs:.5f} ({stats.avg * args.bs:.5f} {uncertainty_stats.avg:.5f})')
+            loss=f'{loss.detach().item():.5f} ({stats.avg:.5f} {uncertainty_stats.avg:.5f})')
 
     progress_bar.close()
 
@@ -198,9 +188,9 @@ def main():
     elif args.level == 2:
         dataset = YTB_train(args.dataset, output_size=400, clip_n=args.clip_n, max_obj_n=args.obj_n)
     elif args.level == 3:
-        dataset1 = DAVIS17_Train(args.davis_train, output_size=400, clip_n=args.clip_n, max_obj_n=args.obj_n,
+        dataset1 = DAVIS17_Train(args.davis_train, output_size=480, clip_n=args.clip_n, max_obj_n=args.obj_n,
                                  repeat_time=5)
-        dataset2 = YTB_train(args.youtube_train, output_size=400, clip_n=args.clip_n, max_obj_n=args.obj_n)
+        dataset2 = YTB_train(args.youtube_train, output_size=480, clip_n=args.clip_n, max_obj_n=args.obj_n)
         dataset = torch.utils.data.ConcatDataset([dataset1, dataset2])
 
     else:
@@ -264,7 +254,7 @@ def main():
     print(myutils.gct(), 'Random seed:', seed)
     torch.manual_seed(seed)
     np.random.seed(seed)
-    
+
     scheduler = torch.optim.lr_scheduler.MultiStepLR(  # 动态调整学习率，每过25个epoch，学习率衰减一半
         optimizer, milestones=args.scheduler_step, gamma=args.gamma, last_epoch=start_epoch - 1)
 
@@ -283,7 +273,7 @@ def main():
     for epoch in progress_bar:
 
         lr = scheduler.get_last_lr()[0]  # 获得上一个epoch的学习率
-            
+
         optimizer.zero_grad()
 
         if args.level != 0:
@@ -300,7 +290,7 @@ def main():
             vis_writer.add_scalar('train/max_skip_YTB', skips[1], epoch)
 
         if args.level != 0:
-            if (epoch + 1) % args.epochs_per_increment == 0:
+            if (epoch + 1) % args.epochs_per_increment == 0 and (epoch + 1) < args.total_epochs * 0.8:
                 if isinstance(dataset, data.ConcatDataset):
                     for dst in dataset.datasets:
                         dst.increase_max_skip()
@@ -308,7 +298,14 @@ def main():
                 else:
                     dataset.increase_max_skip()
                     skips = dataset.max_skip
-
+            elif (epoch + 1) >= args.total_epochs * 0.8:
+                if isinstance(dataset, data.ConcatDataset):
+                    for dst in dataset.datasets:
+                        dst.reload_max_skip()
+                    skips = [ds.max_skip for ds in dataset.datasets]
+                else:
+                    dataset.reload_max_skip()
+                    skips = dataset.max_skip
 
         print('')
         print(myutils.gct(), f'Epoch: {epoch} lr: {lr} max_skip:{skips}')
@@ -325,7 +322,7 @@ def main():
 
             checkpoint_path = f'{model_path}/epoch_{epoch:03d}.pth'
             torch.save(checkpoint, checkpoint_path)
-        
+
         scheduler.step()
     progress_bar.close()
 
@@ -347,6 +344,7 @@ def occumpy_mem(cuda_device):
     x = torch.cuda.FloatTensor(256, 1024, block_mem)
     del x
 
+
 if __name__ == '__main__':
 
     args = get_args()
@@ -356,7 +354,7 @@ if __name__ == '__main__':
     GPU = args.gpu
     print(MODEL, ', Using Dataset:', args.dataset)
     os.environ['CUDA_VISIBLE_DEVICES'] = GPU
-    occumpy_mem(GPU)
+    # occumpy_mem(GPU)
 
     # Device infos
     if torch.cuda.is_available():

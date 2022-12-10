@@ -229,14 +229,17 @@ class DAVIS_Test(data.Dataset):
         video_len = len(img_list)
 
         frames = torch.zeros((video_len, 3, h, w), dtype=torch.float)
-        masks = torch.zeros((1, obj_n, h, w), dtype=torch.float)
+        masks = torch.zeros((video_len, obj_n, h, w), dtype=torch.float)
 
-        mask, _ = self.to_onehot(first_mask_np)
-        masks[0] = mask[:obj_n]
+        
 
         for i in range(video_len):
             img = myutils.load_image_in_PIL(img_list[i], 'RGB')
             frames[i] = self.to_tensor(img)
+            first_mask = myutils.load_image_in_PIL(mask_list[i], 'P')
+            first_mask_np = np.array(first_mask, np.uint8)
+            mask, _ = self.to_onehot(first_mask_np)
+            masks[i] = mask[:obj_n]
 
         info = {
             'name': video_name,

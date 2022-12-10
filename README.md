@@ -1,2 +1,0 @@
-# VOSModel
-vos model

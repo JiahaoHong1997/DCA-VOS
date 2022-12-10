@@ -12,6 +12,11 @@ from dataset import DAVIS_Test, YouTube_Test
 from model import TELG, FeatureBank, MaskBank
 import myutils
 
+from datetime import datetime
+import inspect
+#from gpu_mem_track import MemTracker
+TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
+
 torch.set_grad_enabled(False)
 
 
@@ -31,13 +36,10 @@ def get_args():
                         help='Prefix to the model name.')
     parser.add_argument('--use_pre', action='store_true', 
                         help='If use previous frame.')
-    parser.add_argument('--use_power', action='store_true',
-                        help='If every frames for multi-object and every 5 frames for single-object.')
     return parser.parse_args()
 
 
 def eval_DAVIS(model, model_name, dataloader):
-    fps = myutils.FrameSecondMeter()
 
     for seq_idx, V in enumerate(dataloader):
 
@@ -67,8 +69,11 @@ def eval_DAVIS(model, model_name, dataloader):
             overlay_path = os.path.join(overlay_dir, '00000.png')
             myutils.save_overlay(frames[0], pred, overlay_path, palette)
 
-        fb = FeatureBank(obj_n, int(H/16), int(W/16))
-        k4, v4_list, h, w = model.memorize(frames[0:1], pred_mask, 0, 0, fb)
+        if seq_idx == 0:
+            fps = myutils.FrameSecondMeter()
+
+        k4, v4_list, h, w = model.memorize(frames[0:1], pred_mask, 0, 0)
+        fb = FeatureBank(obj_n, h, w)
         keys = k4.clone()
         values_list = v4_list.copy()
         predforupdate = torch.zeros(1, obj_n, H, W).to(device)
@@ -76,25 +81,22 @@ def eval_DAVIS(model, model_name, dataloader):
         mb = MaskBank(obj_n)
         maskforbank = nn.functional.interpolate(pred_mask, size=(h, w), mode='bilinear', align_corners=True)
         maskforbank = maskforbank.view(obj_n, 1, -1)
-
-        for i in range(obj_n):
-            maskforbank[i] = (maskforbank[i] == i).long()
         mask_list = [maskforbank[i] for i in range(obj_n)]
 
         prev_in_mem = True
 
         for t in tqdm(range(1, frame_n), desc=f'{seq_idx} {seq_name}'):
 
-            fb.init_keys(keys)
-            fb.init_values(values_list)
+            fb.init_bank(keys, values_list)
             mb.init_bank(mask_list)
 
             if not prev_in_mem and args.use_pre:
-                fb.keys = torch.cat([k4,keys], dim=2)
-                fb.update_values(v4_list)
+                fb.update(k4, v4_list)
                 mb.update(prev_list)
-
-            score, _, r4 = model.segment(frames[t:t + 1], fb, mb, False)
+            
+           # if t == frame_n-1:
+           #     gpu_tracker.track()
+            score, _, r4 = model.segment(frames[t:t + 1], fb, mb, False, t)
 
             pred_mask = F.softmax(score, dim=1)
             pred1 = torch.argmax(pred_mask[0], dim=0)
@@ -108,51 +110,29 @@ def eval_DAVIS(model, model_name, dataloader):
             myutils.save_seg_mask(pred, seg_path, palette)
 
             # TODO: 如果前一帧要加入memory，则在此处更新key，value，mask；否则，在之后的if判断中考虑
-            # k4_list, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, r4)
+            # k4, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, r4)
             # maskforbank = nn.functional.interpolate(predforupdate, size=(h, w), mode='bilinear', align_corners=True)
             # maskforbank = maskforbank.view(obj_n, 1, -1)
-            # for i in range(obj_n):
-            #     maskforbank[i] = (maskforbank[i] == i).long()
             # prev_list = [maskforbank[i] for i in range(obj_n)]
 
-            if not args.use_power:
-                if t < frame_n - 1 and t % 5 == 0:
-                    k4, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, r4, fb)
-                    maskforbank = nn.functional.interpolate(predforupdate, size=(h, w), mode='bilinear',
+
+            if t < frame_n - 1 and t % 5 == 0:
+                k4, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, r4)
+                maskforbank = nn.functional.interpolate(predforupdate, size=(h, w), mode='bilinear',
                                                             align_corners=True)
-                    maskforbank = maskforbank.view(obj_n, 1, -1)
+                maskforbank = maskforbank.view(obj_n, 1, -1)
+                prev_list = [maskforbank[i] for i in range(obj_n)]
 
-                    for i in range(obj_n):
-                        maskforbank[i] = (maskforbank[i] == i).long()
-                    prev_list = [maskforbank[i] for i in range(obj_n)]
+                keys = torch.cat([keys, k4], dim=2)
+                for class_idx in range(obj_n):
+                    values_list[class_idx] = torch.cat([values_list[class_idx], v4_list[class_idx]], dim=1)
+                    mask_list[class_idx] = torch.cat([mask_list[class_idx], prev_list[class_idx]], dim=1)
 
-                    keys = fb.keys
-                    for class_idx in range(obj_n):
-                        values_list[class_idx] = torch.cat([values_list[class_idx], v4_list[class_idx]], dim=1)
-                        mask_list[class_idx] = torch.cat([mask_list[class_idx], prev_list[class_idx]], dim=1)
-
-                    prev_in_mem = True
-                else:
-                    prev_in_mem = False
+                prev_in_mem = True
+                #if t == frame_n - 1:
+                #    gpu_tracker.track()
             else:
-                if obj_n == 2:  # single object
-                    if t < frame_n - 1 and t % 5 == 0:
-                        keys = torch.cat([keys, k4], dim=2)
-                        for class_idx in range(obj_n):
-                            values_list[class_idx] = torch.cat([values_list[class_idx], v4_list[class_idx]], dim=1)
-                            mask_list[class_idx] = torch.cat([mask_list[class_idx], prev_list[class_idx]], dim=1)
-
-                        prev_in_mem = True
-                else:  # multi-objects
-                    if t < frame_n - 1 and t % 1 == 0:
-                        keys = torch.cat([keys, k4], dim=2)
-                        for class_idx in range(obj_n):
-                            values_list[class_idx] = torch.cat([values_list[class_idx], v4_list[class_idx]], dim=1)
-                            mask_list[class_idx] = torch.cat([mask_list[class_idx], prev_list[class_idx]], dim=1)
-
-                        prev_in_mem = True
-                    else:
-                        prev_in_mem = False
+                prev_in_mem = False
 
             if args.viz:
                 overlay_path = os.path.join(overlay_dir, f'{t:05d}.png')
@@ -209,23 +189,21 @@ def eval_YouTube(model, model_name, dataloader):
             overlay_path = os.path.join(overlay_dir, basename_list[0] + '.png')
             myutils.save_overlay(frame_out, pred, overlay_path, palette)
 
-        fb = FeatureBank(obj_n, H/16, W/16)
-        k4, v4_list, k4_h, k4_w = model.memorize(frames[0:1], pred_mask, 0, fb)  # 参考帧
-        fb.init_values(v4_list)
+        k4, v4_list, k4_h, k4_w = model.memorize(frames[0:1], pred_mask, 0, 0)  # 参考帧
+        fb = FeatureBank(obj_n, k4_h, k4_w)
+        fb.init_bank(k4, v4_list)
 
         mb = MaskBank(obj_n)
         maskforbank = nn.functional.interpolate(pred_mask, size=(k4_h, k4_w), mode='bilinear', align_corners=True)
         maskforbank = maskforbank.view(obj_n, 1, -1)
 
-        for i in range(obj_n):
-            maskforbank[i] = (maskforbank[i] == i).long()
         mask_list = [maskforbank[i] for i in range(obj_n)]
         mb.init_bank(mask_list)
         predforupdate = torch.zeros(1, obj_n, H, W).to(device)
 
         for t in trange(1, frame_n, desc=f'{seq_idx:3d}/{seq_n:3d} {seq_name}'):
 
-            score, _, r4 = model.segment(frames[t:t + 1], fb, mb, False)
+            score, _, r4 = model.segment(frames[t:t + 1], fb, mb, False, t)
 
             reset_list = list()
             for i in range(1, obj_n):
@@ -248,20 +226,17 @@ def eval_YouTube(model, model_name, dataloader):
                 predforupdate[:, j] = (pred1 == j).long()
 
             if t < frame_n - 1:
-                k4, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, fb)
+                k4, v4_list, _, _ = model.memorize(frames[t:t + 1], pred_mask, t, r4)
                 maskforbank = nn.functional.interpolate(predforupdate, size=(k4_h, k4_w), mode='bilinear',
                                                             align_corners=True)
                 maskforbank = maskforbank.view(obj_n, 1, -1)
 
-                for i in range(obj_n):
-                    maskforbank[i] = (maskforbank[i] == i).long()
                 prev_list = [maskforbank[i] for i in range(obj_n)]
                 if len(reset_list) > 0:
-                    fb.init_keys(k4)
-                    fb.init_values(v4_list)
+                    fb.init_bank(k4, v4_list)
                     mb.init_bank(prev_list)
                 else:
-                    fb.update_values(v4_list)
+                    fb.update(k4, v4_list)
                     mb.update(prev_list)
 
             if basename_list[t] in basename_to_save:
@@ -282,10 +257,11 @@ def eval_YouTube(model, model_name, dataloader):
 
 
 def main():
-
+    #gpu_tracker.track()
     model = TELG(device=device, load_imagenet_params=False)
     model = model.to(device)
     model.eval()
+    #gpu_tracker.track()
 
     if args.resume:
         if os.path.isfile(args.resume):
@@ -331,6 +307,8 @@ if __name__ == '__main__':
     args = get_args()
     print(myutils.gct(), 'Args =', args)
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+    #gpu_tracker = MemTracker(device=args.gpu)
     
     device = torch.device('cuda', 0)
     

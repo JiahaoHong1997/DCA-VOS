@@ -5,8 +5,16 @@ import torch.nn.functional as F
 from torchvision.models import resnet50, resnet18
 
 import myutils
-from model import TimeEncoding
-from model.NonLocalEmmbedding import NONLocalBlock3D
+from model import TimeEncoding, PositionEncoding
+from model.NonLocalEmmbedding import NONLocalBlock2D
+from datetime import datetime
+from dataset.reseed import reseed
+
+
+
+TIMESTAMP = "{0:%Y-%m-%dT%H-%M-%S/}".format(datetime.now())
+import time
+import datetime
 
 
 class BasicConv(nn.Module):
@@ -143,9 +151,9 @@ class ResBlock(nn.Module):
         return x + r
 
 
-class KeyEncoder(nn.Module):
+class CurEncoder(nn.Module):
     def __init__(self, load_imagenet_params):
-        super(KeyEncoder, self).__init__()
+        super(CurEncoder, self).__init__()
 
         resnet = resnet50(pretrained=load_imagenet_params)
         self.conv1 = resnet.conv1
@@ -174,9 +182,9 @@ class KeyEncoder(nn.Module):
         return r4, r3, r2, r1
 
 
-class ValueEncoder(nn.Module):
+class MemEncoder(nn.Module):
     def __init__(self, load_imagenet_params):
-        super(ValueEncoder, self).__init__()
+        super(MemEncoder, self).__init__()
 
         self.conv1_m = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.conv1_o = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
@@ -210,7 +218,6 @@ class ValueEncoder(nn.Module):
         x = self.layer3(x)  # 1/16, 256
 
         x = self.fuser(x, r4)
-
         return x
 
 
@@ -218,7 +225,7 @@ class Matcher(nn.Module):
     def __init__(self):
         super(Matcher, self).__init__()
 
-    def forward(self, feature_bank, q_in, q_out, mask_bank, pre):
+    def forward(self, feature_bank, q_in, q_out, mask_bank, pre, h, w, f_i):
         mem_out_list = []
 
         d_key, bank_n = feature_bank.keys[0].size()  # 128 , t*h*w
@@ -233,12 +240,66 @@ class Matcher(nn.Module):
                 mask_mem = torch.matmul(mask_bank.mask_list[i], p)  # 1, 1, h*w
                 q_out_with_mask = q_out[i] * mask_mem  # Location Guidance
 
+                # ablation study for visual CA only 
+                # tmp = torch.ones_like(mask_mem)
+                # q_out_with_mask = q_out[i] * tmp
+
+                # ablation study for semantic CA only
+                # tmp = torch.ones_like(p)
+                # mem = torch.matmul(feature_bank.values[i], tmp)
+                
+                # # visual result for experiment
+                if f_i >= 0:
+                    from tensorboardX import SummaryWriter
+                    from torchvision.utils import make_grid
+                    import torch.nn as nn
+                    writer = SummaryWriter(comment=TIMESTAMP)
+                
+                    mmem = mem.reshape(mem.size()[0], mem.size()[1], h, w)
+                    curr = q_out.reshape(q_out.size()[0], q_out.size()[1], h, w)
+                    currWithMask = q_out_with_mask.reshape(1, q_out.size()[1], h, w)
+                    mmask_mem = mask_mem.reshape(mask_mem.size()[0], mask_mem.size()[1], h, w)
+                    
+                    curr = nn.functional.interpolate(curr, size=(h*16, w*16), mode='bilinear', align_corners=True)
+                    currWithMask = nn.functional.interpolate(currWithMask, size=(h*16, w*16), mode='bilinear', align_corners=True)
+                    curr = curr[:,490:510,:,:]
+                    currWithMask = currWithMask[:,490:510,:,:]
+                    mmem = nn.functional.interpolate(mmem, size=(h*16, w*16), mode='bilinear', align_corners=True)
+                    mmem = mmem[:,:100,:,:]
+                    
+                    writer.add_image('mem',
+                                make_grid(mmem[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+                                          pad_value=1, scale_each=True, range=(0, 1)), i)
+                    writer.add_image('curr',
+                                 make_grid(curr[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+                                           pad_value=1, scale_each=True, range=(0, 1)), i)
+                    writer.add_image('currWithMask',
+                                 make_grid(currWithMask[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1,
+                                           normalize=True,
+                                           pad_value=1, scale_each=True, range=(0, 1)), i)
+                    writer.add_image('mmask_mem',
+                                 make_grid(mmask_mem[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1,
+                                           normalize=True,
+                                           pad_value=1, scale_each=True, range=(0, 1)), i)
+                    time.sleep(1)
+                    writer.flush()
+                    writer.close()
+
                 mem_out_list.append(torch.cat([mem, q_out_with_mask], dim=1))  # frame_idx, 1024, h*w
         else:
             for i in range(0, feature_bank.obj_n):
                 mem = torch.matmul(feature_bank.values[i], p)  # frame_idx, 512, h*w
                 mask_mem = torch.matmul(mask_bank.mask_list[i], p)  # 1, 1, h*w
                 q_out_with_mask = q_out * mask_mem  # Location Guidance
+
+
+                 # ablation study for visual CA only 
+                # tmp = torch.ones_like(mask_mem)
+                # q_out_with_mask = q_out * tmp
+
+                # ablation study for semantic CA only
+                # tmp = torch.ones_like(p)
+                # mem = torch.matmul(feature_bank.values[i], tmp)
 
                 mem_out_list.append(torch.cat([mem, q_out_with_mask], dim=1))  # frame_idx, 1024, h*w
 
@@ -289,17 +350,27 @@ class Decoder(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
 
     def forward(self, r4, r3, r2, r1=None, feature_shape=None):
+        # from tensorboardX import SummaryWriter
+        # from torchvision.utils import make_grid
+        # writer = SummaryWriter(comment=TIMESTAMP)
 
         m4 = self.ResMM(self.convFM(r4))  # 1024 -> hidden_dim  1/16
         m3 = self.RF3(r3, m4)  # hidden_dim  1/8
         m2 = self.RF2(r2, m3)  # hidden_dim  1/4
 
         p2 = self.pred2(F.relu(m2))
-        p = F.interpolate(p2, scale_factor=2, mode='bilinear', align_corners=False)  # 1
+        p = F.interpolate(p2, scale_factor=2, mode='bilinear', align_corners=False)  # 1/2
 
         bs, obj_n, h, w = feature_shape
         rough_seg = F.softmax(p, dim=1)[:, 1]
+        
         rough_seg = rough_seg.view(bs, obj_n, h, w)
+        
+        # x = rough_seg.view(obj_n, 1, h, w)
+        # for i in range (0, bs*obj_n):
+        #     writer.add_image('before',
+        #             make_grid(x[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
         rough_seg = F.softmax(rough_seg, dim=1)  # object-level normalization
 
         # Local refinement
@@ -307,7 +378,38 @@ class Decoder(nn.Module):
         uncertainty = uncertainty.expand(-1, obj_n, -1, -1).reshape(bs * obj_n, 1, h, w)
 
         rough_seg = rough_seg.view(bs * obj_n, 1, h, w)  # bs*obj_n, 1, h, w
-        r1_weighted = r1 * rough_seg
+
+        
+        #     writer.add_image('layer1',
+        #             make_grid(m4[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
+        #     writer.add_image('layer2',
+        #             make_grid(m3[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
+        #     writer.add_image('layer3',
+        #             make_grid(m2[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
+            
+        # writer.flush()
+        # writer.close()
+
+
+
+
+        a = torch.ones_like(uncertainty)
+        b = torch.zeros_like(uncertainty)
+        uncertainty = torch.where(uncertainty>0.7,a,b)
+
+        # for i in range (0, bs*obj_n):
+        #     writer.add_image('unRegion',
+        #             make_grid(uncertainty[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
+        # writer.flush()
+        # writer.close()
+        # import time
+        # time.sleep(2)
+
+        r1_weighted = r1 * rough_seg * uncertainty
         r1_local = self.local_max(r1_weighted)  # bs*obj_n, 64, h, w
         r1_local = r1_local / (self.local_max(rough_seg) + 1e-8)  # neighborhood reference
         r1_conf = self.local_avg(rough_seg)  # bs*obj_n, 1, h, w
@@ -318,9 +420,18 @@ class Decoder(nn.Module):
 
         p = p + uncertainty * q
         p = F.interpolate(p, scale_factor=2, mode='bilinear', align_corners=False)
-
         p = F.softmax(p, dim=1)[:, 1]
 
+        # xx = p.view(obj_n, 1, 480, -1)
+        # for i in range (0, bs*obj_n):
+        #     writer.add_image('after',
+        #             make_grid(xx[i].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+        #             pad_value=1, scale_each=True, range=(0, 1)), i)
+        # time.sleep(1)
+        # writer.flush()
+        # writer.close()
+
+        # ret = F.interpolate(rret, scale_factor=2, mode='bilinear', align_corners=False)
         return p
 
 
@@ -328,8 +439,8 @@ class TELG(nn.Module):
     def __init__(self, device, load_imagenet_params=False):
         super(TELG, self).__init__()
 
-        self.key_encoder = KeyEncoder(load_imagenet_params)
-        self.value_encoder = ValueEncoder(load_imagenet_params)
+        self.cur_encoder = CurEncoder(load_imagenet_params)
+        self.mem_encoder = MemEncoder(load_imagenet_params)
 
         # Projection from f16 feature space to key space
         self.key_proj = KeyProjection(1024, keydim=64)
@@ -337,14 +448,15 @@ class TELG(nn.Module):
         # Compress f16 a bit to use in ecoding later on
         self.key_comp = nn.Conv2d(1024, 512, kernel_size=3, padding=1)
 
+        self.pos = PositionEncoding.PositionEncoding(d_hid=1024)
+        self.self_attention = NONLocalBlock2D(in_channels=1024)
         self.te = TimeEncoding.TimeEncoding(d_hid=1024)
-        self.self_attention = NONLocalBlock3D(in_channels=64)
 
         self.matcher = Matcher()
 
         self.decoder = Decoder(device)
 
-    def memorize(self, frame, mask, frame_idx, f16, fb_global):
+    def memorize(self, frame, mask, frame_idx, f16):
 
         _, K, H, W = mask.shape
 
@@ -354,48 +466,61 @@ class TELG(nn.Module):
         mask_ones = torch.ones_like(mask)
         mask_inv = (mask_ones - mask).clamp(0, 1)
 
+        # from tensorboardX import SummaryWriter
+        # from torchvision.utils import make_grid
+        # writer = SummaryWriter(comment=TIMESTAMP)
+
         if frame_idx == 0:
-            r4, _, _, _ = self.key_encoder(frame)
+            r4, _, _, _ = self.cur_encoder(frame)
+            # x1 = r4[:,700:900,:,:]
+            # x1 = nn.functional.interpolate(x1, size=(r4.size(2)*16, r4.size(3)*16), mode='bilinear', align_corners=True)
+            # writer.add_image('r4_pre',
+            #                 make_grid(x1[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+            #                           pad_value=1, scale_each=True, range=(0, 1)))
+
+            # U-Net exp
+            r4 = self.pos(r4)
+            r4 = self.self_attention(r4)
+            h, w = r4.size(2), r4.size(3)
+            r4 = self.te(r4.reshape(1, 1024, -1), frame_idx).reshape(1, 1024, h, w)
+
+            # x2 = r4[:,700:900,:,:]
+            # x2 = nn.functional.interpolate(x2, size=(r4.size(2)*16, r4.size(3)*16), mode='bilinear', align_corners=True)
+            # writer.add_image('r4',
+            #                 make_grid(x2[0].detach().cpu().unsqueeze(dim=1), nrow=20, padding=1, normalize=True,
+            #                           pad_value=1, scale_each=True, range=(0, 1)))
+            # writer.flush()
+            # writer.close()
         else:
             r4 = f16
+
         h, w = r4.size(2), r4.size(3)
-
-        # key
-        r4 = self.te(r4.reshape(1, 1024, -1), frame_idx).reshape(1, 1024, h, w)
         k4 = self.key_proj(r4)
-        k4 = k4.reshape(1, 64, h * w)
-        if frame_idx == 0:
-            fb_global.init_keys(k4)
-            kk4 = fb_global.keys
-        else:
-            kk4 = torch.cat([k4, fb_global.keys.view(-1, 64, h * w)], dim=0)
-
-        kk4 = kk4.unsqueeze(0).view(1, -1, 64, h, w)
-        kk4 = torch.transpose(kk4, 1, 2)
-        kk4 = self.self_attention(kk4).squeeze(0).view(64, -1, h * w * (frame_idx + 1)).transpose(0, 1)
-        fb_global.update_keys(kk4)
-
-        # value
         r4_k = r4.expand(K, -1, -1, -1)
-        v4 = self.value_encoder(frame, r4_k, mask, mask_inv)
+        v4 = self.mem_encoder(frame, r4_k, mask, mask_inv)
+
+        k4 = k4.reshape(1, 64, h * w)
         v4 = v4.reshape(K, 512, h * w)
         v4_list = [v4[i] for i in range(K)]
-
         return k4, v4_list, h, w
 
-    def segment(self, frame, fb_global, mb, pre=False):
+    def segment(self, frame, fb_global, mb, pre=False, frame_idx=1):
 
         obj_n = fb_global.obj_n
         # pad
         if not self.training:
             [frame], pad = myutils.pad_divide_by([frame], 16, (frame.size()[2], frame.size()[3]))
 
-        r4, r3, r2, r1 = self.key_encoder(frame)
-
+        r4, r3, r2, r1 = self.cur_encoder(frame)
         bs, _, global_match_h, global_match_w = r4.shape
         _, _, local_match_h, local_match_w = r1.shape
 
         if pre is not True:
+            # U-Net exp
+            r4 = self.pos(r4)
+            r4 = self.self_attention(r4)
+            r4 = self.te(r4.reshape(1, 1024, -1), frame_idx).reshape(1, 1024, global_match_h, global_match_w)
+
             k4 = self.key_proj(r4)
             r4_k = r4.expand(obj_n, -1, -1, -1)
             v4 = self.key_comp(r4_k)
@@ -406,7 +531,7 @@ class TELG(nn.Module):
         k4 = k4.view(-1, 64, global_match_h * global_match_w)
         v4 = v4.view(-1, 512, global_match_h * global_match_w)
 
-        res_global = self.matcher(fb_global, k4, v4, mb, pre)
+        res_global = self.matcher(fb_global, k4, v4, mb, pre, global_match_h, global_match_w, frame_idx)
         res_global = res_global.reshape(bs * obj_n, 1024, global_match_h, global_match_w)
 
         r3_size = r3.shape

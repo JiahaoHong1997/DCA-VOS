@@ -27,6 +27,17 @@ def calc_uncertainty(score):
     score_top, _ = score.topk(k=2, dim=1)
     uncertainty = score_top[:, 0] / (score_top[:, 1] + 1e-8)  # bs, h, w
     uncertainty = torch.exp(1 - uncertainty).unsqueeze(1)  # bs, 1, h, w
+    
+
+    # bs, obj_n, h, w = score.size()
+    # score_top, _ = score.topk(k=obj_n, dim=1)
+    # uncertainty = -1*(score_top[:, 0]*torch.log(score_top[:, 0]))
+    # for i in range (1,obj_n):
+    #     uncertainty += -1*(score_top[:, i]*torch.log(score_top[:, i]))
+
+    # uncertainty = uncertainty.unsqueeze(0)
+    # uncertainty = (uncertainty-torch.min(uncertainty))/(torch.max(uncertainty)-torch.min(uncertainty))
+    # print(uncertainty)
     return uncertainty
 
 
@@ -118,7 +129,7 @@ def save_seg_mask(pred, seg_path, palette):
     seg_img.save(seg_path)
 
 
-def add_overlay(img, mask, colors, alpha=0.7, cscale=1):
+def add_overlay(img, mask, colors, alpha=0.4, cscale=2):
     ids = np.unique(mask)
     img_overlay = img.copy()
     ones_np = np.ones(img.shape) * (1 - alpha)
@@ -138,7 +149,7 @@ def add_overlay(img, mask, colors, alpha=0.7, cscale=1):
     return img_overlay
 
 
-def save_overlay(img, mask, overlay_path, colors=[255, 0, 0], alpha=0.4, cscale=1):
+def save_overlay(img, mask, overlay_path, colors=[255, 0, 0], alpha=0.4, cscale=2):
     img = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 

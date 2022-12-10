@@ -8,9 +8,12 @@ from itertools import compress
 import torch
 from torch.utils import data
 import torchvision.transforms as TF
+from torchvision import transforms
 
 import myutils
 from transforms import transforms as mytrans
+import dataset
+from torchvision.transforms import InterpolationMode
 
 MAX_TRAINING_SKIP = 5
 
@@ -24,6 +27,7 @@ class YTB_train(data.Dataset):
         self.max_obj_n = max_obj_n
         self.increment = increment
         self.max_skip = max_skip
+        self.crop = True
 
         dataset_path = os.path.join(root, dataset_file)
         with open(dataset_path, 'r') as json_file:  # 读取json文件
@@ -32,11 +36,42 @@ class YTB_train(data.Dataset):
         self.dataset_list = list(meta_data['videos'])
         self.dataset_size = len(self.dataset_list)
 
+        # # These set of transform is the same for im/gt pairs, but different among the 3 sampled frames
+        self.pair_im_lone_transform = transforms.Compose([
+            transforms.ColorJitter(0.01, 0.01, 0.01, 0),
+        ])
+        self.pair_im_dual_transform = transforms.Compose([
+            transforms.RandomAffine(degrees=15, shear=10, interpolation=InterpolationMode.BICUBIC, fill=(124, 116, 104)),
+        ])
 
-        self.random_horizontal_flip = mytrans.RandomHorizontalFlip(0.3)
-        self.color_jitter = TF.ColorJitter(0.1, 0.1, 0.1, 0.02)
-        self.random_affine = mytrans.RandomAffine(degrees=15, translate=(0.1, 0.1), scale=(0.95, 1.05), shear=10)
-        self.random_resize_crop = mytrans.RandomResizedCrop(output_size, (0.3, 0.5), (0.95, 1.05))
+        self.pair_gt_dual_transform = transforms.Compose([
+            transforms.RandomAffine(degrees=15, shear=10, interpolation=InterpolationMode.NEAREST, fill=0),
+        ])
+
+        # These transform are the same for all pairs in the sampled sequence
+        self.all_im_lone_transform = transforms.Compose([
+            transforms.ColorJitter(0.1, 0.03, 0.03, 0),
+            transforms.RandomGrayscale(0.05),
+        ])
+        self.all_im_dual_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop((self.output_size, self.output_size), scale=(0.36, 1.00),
+                                         interpolation=InterpolationMode.BICUBIC)
+        ])
+        self.all_im_dual_transform_nocrop = transforms.Compose([
+            transforms.Resize(self.output_size, InterpolationMode.BICUBIC),
+            transforms.RandomHorizontalFlip()
+        ])
+        self.all_gt_dual_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop((self.output_size, self.output_size), scale=(0.36, 1.00),
+                                         interpolation=InterpolationMode.NEAREST)
+        ])
+        self.all_gt_dual_transform_nocrop = transforms.Compose([
+            transforms.Resize(self.output_size, InterpolationMode.NEAREST),
+            transforms.RandomHorizontalFlip()
+            
+        ])
         self.to_tensor = TF.ToTensor()
         self.to_onehot = mytrans.ToOnehot(max_obj_n, shuffle=False)
 
@@ -82,33 +117,43 @@ class YTB_train(data.Dataset):
 
         frames = torch.zeros((self.clip_n, 3, self.output_size, self.output_size), dtype=torch.float)
         masks = torch.zeros((self.clip_n, self.max_obj_n, self.output_size, self.output_size), dtype=torch.float)
-
+        sequence_seed = np.random.randint(2147483647)
         for i, frame_idx in enumerate(idx_list):
-            img = myutils.load_image_in_PIL(img_list[frame_idx], 'RGB')
-            mask = myutils.load_image_in_PIL(mask_list[frame_idx], 'P')
+            img_pil = myutils.load_image_in_PIL(img_list[frame_idx], 'RGB')
+            mask_pil = myutils.load_image_in_PIL(mask_list[frame_idx], 'P')
 
-            if i > 0:
-                img = self.color_jitter(img)
-                img, mask = self.random_affine(img, mask)
+            img, mask = img_pil, mask_pil
+            dataset.reseed(sequence_seed)
+            if not self.crop:
+                img = self.all_im_dual_transform_nocrop(img)
+                img = self.all_im_lone_transform(img)
+                dataset.reseed(sequence_seed)
+                mask = self.all_gt_dual_transform_nocrop(mask)
+            else:
+                img = self.all_im_dual_transform(img)
+                img = self.all_im_lone_transform(img)
+                dataset.reseed(sequence_seed)
+                mask = self.all_gt_dual_transform(mask)
 
-            roi_cnt = 0
-            while roi_cnt < 10:
-                img_roi, mask_roi = self.random_resize_crop(img, mask)
-                mask_roi = np.array(mask_roi, np.uint8)
+            pairwise_seed = np.random.randint(2147483647)
+            dataset.reseed(pairwise_seed)
+            img = self.pair_im_dual_transform(img)  # 仿射 resize 裁剪
+            img = self.pair_im_lone_transform(img)  # 颜色
+            dataset.reseed(pairwise_seed)
+            mask = self.pair_gt_dual_transform(mask)
 
-                if i == 0:
-                    mask_roi, obj_list = self.to_onehot(mask_roi)
-                    obj_n = len(obj_list) + 1
-                else:
-                    mask_roi, _ = self.to_onehot(mask_roi, obj_list)
+            mask = np.array(mask, np.uint8)
 
-                if torch.any(mask_roi[0] == 0).item():
-                    break
+            if i == 0:
+                mask, obj_list = self.to_onehot(mask)
+                obj_n = len(obj_list) + 1
+            else:
+                mask, _ = self.to_onehot(mask, obj_list)
 
-                roi_cnt += 1
 
-            frames[i] = self.to_tensor(img_roi)
-            masks[i] = mask_roi
+
+            frames[i] = self.to_tensor(img)
+            masks[i] = mask
 
         info = {
             'name': video_name,  # 视频编号
